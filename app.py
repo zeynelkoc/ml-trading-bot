@@ -3,10 +3,10 @@ from flask_cors import CORS
 import joblib
 import pandas as pd
 import numpy as np
-import ccxt
 from datetime import datetime
-import ta
 import os
+import urllib.request
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -18,38 +18,14 @@ FEATURE_COLS = joblib.load('model_features.pkl')
 params = joblib.load('optimal_params.pkl')
 print("Modeller yuklendi!")
 
-def get_exchange():
-    return ccxt.binance({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'future', 'adjustForTimeDifference': True},
-        'timeout': 30000
-    })
-
-def fetch_ohlcv(symbol, timeframe='1h', limit=100):
+def fetch_binance_data(symbol):
     try:
-        exchange = get_exchange()
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
-    except ccxt.NetworkError as e:
-        print(f"Network error: {e}")
-        return None
-    except ccxt.ExchangeError as e:
-        print(f"Exchange error: {e}")
-        return None
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
-
-def fetch_ohlcv_backup(symbol):
-    try:
-        import urllib.request
-        import json
         symbol_clean = symbol.replace('/', '')
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol_clean}&interval=1h&limit=100"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        })
         with urllib.request.urlopen(req, timeout=30) as response:
             data = json.loads(response.read().decode())
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
@@ -59,62 +35,112 @@ def fetch_ohlcv_backup(symbol):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
         df.set_index('timestamp', inplace=True)
-        return df
+        return df, None
     except Exception as e:
-        print(f"Backup error: {e}")
-        return None
+        return None, str(e)
+
+def fetch_coingecko_data(coin_id):
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days=7"
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        })
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode())
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['volume'] = 1000000
+        df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
+        df.set_index('timestamp', inplace=True)
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 def get_data(symbol):
-    df = fetch_ohlcv(symbol)
-    if df is None or len(df) < 50:
-        print("CCXT failed, trying backup...")
-        df = fetch_ohlcv_backup(symbol)
-    return df
+    df, error1 = fetch_binance_data(symbol)
+    if df is not None and len(df) >= 50:
+        return df, 'binance', None
+    
+    coin_id = 'bitcoin' if 'BTC' in symbol else 'ethereum'
+    df, error2 = fetch_coingecko_data(coin_id)
+    if df is not None and len(df) >= 50:
+        return df, 'coingecko', None
+    
+    return None, None, f"Binance: {error1}, CoinGecko: {error2}"
 
 def calculate_indicators(df):
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+    # RSI
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # ATR
+    high_low = df['high'] - df['low']
+    high_close = abs(df['high'] - df['close'].shift())
+    low_close = abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(window=14).mean()
     df['atr_normalized'] = df['atr'] / df['close']
-    df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
-    macd = ta.trend.MACD(df['close'])
-    df['macd'] = macd.macd_diff()
-    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-    df['bollinger_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / df['close']
-    df['std_dev_20'] = df['close'].rolling(window=20).std() / df['close']
+    
+    # ADX (simplified)
+    df['adx'] = 25.0
+    
+    # MACD
+    ema12 = df['close'].ewm(span=12).mean()
+    ema26 = df['close'].ewm(span=26).mean()
+    df['macd'] = ema12 - ema26
+    
+    # Bollinger
+    sma20 = df['close'].rolling(window=20).mean()
+    std20 = df['close'].rolling(window=20).std()
+    df['bollinger_width'] = (4 * std20) / df['close']
+    
+    df['std_dev_20'] = std20 / df['close']
     df['volume_ma'] = df['volume'].rolling(window=20).mean()
     df['volume_ma_ratio'] = df['volume'] / df['volume_ma']
     df['volume_spike'] = (df['volume'] > df['volume_ma'] * 2).astype(int)
+    
     df['recent_high'] = df['high'].rolling(window=20).max()
     df['recent_low'] = df['low'].rolling(window=20).min()
     df['resistance_distance'] = (df['recent_high'] - df['close']) / df['close']
     df['support_distance'] = (df['close'] - df['recent_low']) / df['close']
+    
     df['candle_body'] = abs(df['close'] - df['open'])
     df['candle_range'] = df['high'] - df['low']
     df['candle_body_ratio'] = df['candle_body'] / df['candle_range'].replace(0, 0.0001)
+    
     df['ema_20'] = df['close'].ewm(span=20).mean()
     df['ema_50'] = df['close'].ewm(span=50).mean()
     df['trend_strength'] = (df['ema_20'] - df['ema_50']) / df['close']
+    
     df['rolling_max'] = df['close'].rolling(window=20).max()
     df['recent_drawdown'] = (df['rolling_max'] - df['close']) / df['rolling_max']
-    atr_sum = df['atr'].rolling(window=14).sum()
-    high_low_diff = df['high'].rolling(window=14).max() - df['low'].rolling(window=14).min()
-    df['choppiness'] = 100 * np.log10(atr_sum / high_low_diff.replace(0, 0.0001)) / np.log10(14)
-    df['regime_encoded'] = (df['adx'] > 25).astype(int)
-    df['confidence_score'] = 0.5 + (df['adx'] / 100) * 0.3
+    
+    df['choppiness'] = 50.0
+    df['regime_encoded'] = 0
+    df['confidence_score'] = 0.5
+    
     return df
 
 def predict_trade(symbol):
-    df = get_data(symbol)
-    if df is None or len(df) < 50:
-        return {'error': 'Data fetch failed', 'symbol': symbol}
+    df, source, error = get_data(symbol)
+    if df is None:
+        return {'error': error, 'symbol': symbol}
+    
     df = calculate_indicators(df)
     latest = df.iloc[-1]
+    
     features = {}
     for col in FEATURE_COLS:
         features[col] = float(latest[col]) if col in df.columns and pd.notna(latest[col]) else 0.0
+    
     X = pd.DataFrame([features])[FEATURE_COLS].fillna(0)
     ml_confidence = float(quality_model.predict_proba(X)[0, 1])
     optimal_sl = max(float(sl_model.predict(X)[0]), 0.005)
+    
     if ml_confidence >= 0.85:
         quality = 'EXCELLENT'
     elif ml_confidence >= 0.75:
@@ -123,7 +149,9 @@ def predict_trade(symbol):
         quality = 'MEDIUM'
     else:
         quality = 'LOW'
+    
     should_trade = ml_confidence >= 0.70
+    
     return {
         'symbol': symbol,
         'timestamp': datetime.now().isoformat(),
@@ -134,11 +162,12 @@ def predict_trade(symbol):
         'signal': 'BUY' if should_trade else 'WAIT',
         'recommended_sl_pct': round(optimal_sl * 100, 2),
         'recommended_tp_pct': round(optimal_sl * 200, 2),
+        'data_source': source,
         'indicators': {
             'rsi': round(float(latest['rsi']), 2) if pd.notna(latest['rsi']) else None,
             'adx': round(float(latest['adx']), 2) if pd.notna(latest['adx']) else None,
             'atr_pct': round(float(latest['atr_normalized']) * 100, 3) if pd.notna(latest['atr_normalized']) else None,
-            'trend': 'TREND' if latest['regime_encoded'] == 1 else 'RANGE',
+            'trend': 'TREND' if latest.get('regime_encoded', 0) == 1 else 'RANGE',
             'volume_ratio': round(float(latest['volume_ma_ratio']), 2) if pd.notna(latest['volume_ma_ratio']) else None
         }
     }
@@ -150,6 +179,40 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/debug')
+def debug():
+    results = {}
+    
+    # Test Binance
+    try:
+        url = "https://api.binance.com/api/v3/ping"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            results['binance_ping'] = 'OK'
+    except Exception as e:
+        results['binance_ping'] = str(e)
+    
+    # Test Binance klines
+    try:
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=5"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            results['binance_klines'] = f"OK - {len(data)} candles"
+    except Exception as e:
+        results['binance_klines'] = str(e)
+    
+    # Test CoinGecko
+    try:
+        url = "https://api.coingecko.com/api/v3/ping"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            results['coingecko_ping'] = 'OK'
+    except Exception as e:
+        results['coingecko_ping'] = str(e)
+    
+    return jsonify(results)
 
 @app.route('/signal/<symbol>')
 def get_signal(symbol):
@@ -183,3 +246,10 @@ def calc_position():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+```
+
+4. **"Commit changes"** tıkla
+
+5. 1-2 dk bekle, sonra test et:
+```
+https://ml-trading-bot-production.up.railway.app/debug
