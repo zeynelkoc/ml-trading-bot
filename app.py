@@ -18,17 +18,58 @@ FEATURE_COLS = joblib.load('model_features.pkl')
 params = joblib.load('optimal_params.pkl')
 print("Modeller yuklendi!")
 
-exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+def get_exchange():
+    return ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future', 'adjustForTimeDifference': True},
+        'timeout': 30000
+    })
 
 def fetch_ohlcv(symbol, timeframe='1h', limit=100):
     try:
+        exchange = get_exchange()
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df
-    except Exception as e:
+    except ccxt.NetworkError as e:
+        print(f"Network error: {e}")
         return None
+    except ccxt.ExchangeError as e:
+        print(f"Exchange error: {e}")
+        return None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def fetch_ohlcv_backup(symbol):
+    try:
+        import urllib.request
+        import json
+        symbol_clean = symbol.replace('/', '')
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol_clean}&interval=1h&limit=100"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode())
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                          'close_time', 'quote_volume', 'trades', 'taker_buy_base', 
+                                          'taker_buy_quote', 'ignore'])
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
+        df.set_index('timestamp', inplace=True)
+        return df
+    except Exception as e:
+        print(f"Backup error: {e}")
+        return None
+
+def get_data(symbol):
+    df = fetch_ohlcv(symbol)
+    if df is None or len(df) < 50:
+        print("CCXT failed, trying backup...")
+        df = fetch_ohlcv_backup(symbol)
+    return df
 
 def calculate_indicators(df):
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
@@ -63,9 +104,9 @@ def calculate_indicators(df):
     return df
 
 def predict_trade(symbol):
-    df = fetch_ohlcv(symbol, '1h', 100)
+    df = get_data(symbol)
     if df is None or len(df) < 50:
-        return {'error': 'Data error', 'symbol': symbol}
+        return {'error': 'Data fetch failed', 'symbol': symbol}
     df = calculate_indicators(df)
     latest = df.iloc[-1]
     features = {}
